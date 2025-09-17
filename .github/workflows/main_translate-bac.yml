@@ -70,7 +70,7 @@ jobs:
       # Detener la App Service antes del despliegue
       - name: Stop Azure Web App
         run: |
-          az webapp stop --name translate-bac --resource-group <NOMBRE_DE_TU_RESOURCE_GROUP>
+          az webapp stop --name translate-bac --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }}
 
       # Desplegar app con limpieza de archivos viejos
       - name: Deploy to Azure Web App
@@ -84,4 +84,4 @@ jobs:
       # Reiniciar la App Service después del despliegue
       - name: Start Azure Web App
         run: |
-          az webapp start --name translate-bac --resource-group <NOMBRE_DE_TU_RESOURCE_GROUP>
+          az webapp start --name translate-bac --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }}
