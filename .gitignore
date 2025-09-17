@@ -1,6 +1,7 @@
 # Entornos virtuales
 venv/
 BK/
+app/
 venv_azure/ # O el nombre que le hayas dado a tu venv
 *.pyc
 *.mp3
