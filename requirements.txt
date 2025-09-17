@@ -10,7 +10,7 @@ colorama==0.4.6
 dnspython==2.7.0
 ecdsa==0.19.1
 email-validator==2.3.0
-fastapi==0.111.0
+fastapi==0.116.1
 fastapi-cli==0.0.10
 fastapi-cloud-cli==0.1.5
 filelock==3.19.1
