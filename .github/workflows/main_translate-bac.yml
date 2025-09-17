@@ -1,8 +1,6 @@
-# Workflow: Build and deploy Python app to Azure Web App - translate-bac
-# Docs:
-# - Azure Web Apps Deploy action: https://github.com/Azure/webapps-deploy
-# - Azure CLI login action: https://github.com/Azure/login
-# - Python on Azure App Service: https://aka.ms/python-webapps-actions
+# Docs for the Azure Web Apps Deploy action: https://github.com/Azure/webapps-deploy
+# More GitHub Actions for Azure: https://github.com/Azure/actions
+# More info on Python, GitHub Actions, and Azure App Service: https://aka.ms/python-webapps-actions
 
 name: Build and deploy Python app to Azure Web App - translate-bac
 
@@ -16,11 +14,10 @@ jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: read #This is required for actions/checkout
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Set up Python version
         uses: actions/setup-python@v5
@@ -31,13 +28,11 @@ jobs:
         run: |
           python -m venv venv
           source venv/bin/activate
-
+      
       - name: Install dependencies
         run: pip install -r requirements.txt
-
-      # Optional: Add test steps here
-      # - name: Run tests
-      #   run: pytest
+        
+      # Optional: Add step to run tests here (PyTest, Django test suites, etc.)
 
       - name: Upload artifact for deployment jobs
         uses: actions/upload-artifact@v4
@@ -51,38 +46,26 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     permissions:
-      id-token: write
-      contents: read
+      id-token: write #This is required for requesting the JWT
+      contents: read #This is required for actions/checkout
 
     steps:
       - name: Download artifact from build job
         uses: actions/download-artifact@v4
         with:
           name: python-app
-
+      
       - name: Login to Azure
         uses: azure/login@v2
         with:
-          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_3131E1897E0642248755B2FF4493FC0C }}
-          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_A3D4E3582E2B474297FC5AD52B468EE3 }}
-          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_D55F8212A2F24792B32EBDF4224A4485 }}
+          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_7082FB9E360A49669D563263276B1BE7 }}
+          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_8C37ADE8455A4DD9906B0D3BA758C0C0 }}
+          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_1E7B67B862F34DFCB70E0476E3603942 }}
 
-      # Detener la App Service antes del despliegue
-      - name: Stop Azure Web App
-        run: |
-          az webapp stop --name translate-bac --resource-group "${{ secrets.AZURE_RESOURCE_GROUP }}"
-
-      # Desplegar app con limpieza de archivos viejos
-      - name: Deploy to Azure Web App
+      - name: 'Deploy to Azure Web App'
         uses: azure/webapps-deploy@v3
         id: deploy-to-webapp
         with:
           app-name: 'translate-bac'
           slot-name: 'Production'
-          clean: true   # Limpia wwwroot antes de desplegar
-
-      # Reiniciar la App Service después del despliegue
-      - name: Start Azure Web App
-        run: |
-          az webapp start --name translate-bac --resource-group "${{ secrets.AZURE_RESOURCE_GROUP }}"
-
+          
