@@ -5,25 +5,40 @@ import json
 import asyncio
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
-import azure.cognitiveservices.speech as speechsdk
+from dotenv import load_dotenv
 from threading import Thread
+
+import azure.cognitiveservices.speech as speechsdk
+from azure.cognitiveservices.speech import speech
 
 app = FastAPI()
 
 # Mapeo de oyentes por idioma
 listeners = {}
 
+# Cargar .env
+load_dotenv()
+
 # Variables de entorno para las credenciales de Azure
 SPEECH_KEY = os.getenv("SPEECH_KEY")
 SPEECH_REGION = os.getenv("SPEECH_REGION")
 
 # Configuración del servicio de voz de Azure
-speech_config = speechsdk.SpeechTranslationConfig(
-    subscription=SPEECH_KEY,
-    region=SPEECH_REGION
+# speech_config = speechsdk.SpeechTranslationConfig(
+#     subscription=SPEECH_KEY,
+#     region=SPEECH_REGION
+# )
+
+speech_translation_config = speechsdk.translation.SpeechTranslationConfig(
+    subscription=os.getenv("SPEECH_KEY"),
+    region=os.getenv("SPEECH_REGION")
 )
-speech_config.set_property(
-    speechsdk.PropertyId.Speech_SegmentationSilenceTimeoutMs, "3000"
+
+# speech_translation_config.set_property(
+#     speechsdk.PropertyId.SpeechServiceConnection_SingleLanguageTranslation, "true"
+# )
+speech_translation_config.set_property(
+    speechsdk.PropertyId.SpeechServiceConnection_InitialSilenceTimeoutMs, "500"
 )
 
 # Endpoint para el orador
