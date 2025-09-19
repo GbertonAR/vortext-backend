@@ -125,7 +125,25 @@ async def websocket_listener(websocket: WebSocket, lang: str):
             if not listeners[lang]:
                 del listeners[lang]
                 print(f"No quedan oyentes para el idioma {lang}. Eliminando la clave.")
-                
+
+# Endpoint web simple para comprobar servidor
+@app.get("/", response_class=HTMLResponse)
+def root():
+    return """
+    <!doctype html>
+    <html>
+      <head>
+        <meta charset="utf-8"/>
+        <title>Vortex Live Translation - Server</title>
+      </head>
+      <body>
+        <h2>Vortex Live Translation - Backend</h2>
+        <p>Servidor en ejecución.</p>
+      </body>
+    </html>
+    """
+
+               
 if __name__ == "__main__":  
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)             
