@@ -2,7 +2,7 @@
 # More GitHub Actions for Azure: https://github.com/Azure/actions
 # More info on Python, GitHub Actions, and Azure App Service: https://aka.ms/python-webapps-actions
 
-name: Build and deploy Python app to Azure Web App - translate-bac
+name: Build and deploy Python app to Azure Web App - web1-translate
 
 on:
   push:
@@ -22,7 +22,7 @@ jobs:
       - name: Set up Python version
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.13'
 
       - name: Create and start virtual environment
         run: |
@@ -58,14 +58,14 @@ jobs:
       - name: Login to Azure
         uses: azure/login@v2
         with:
-          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_7082FB9E360A49669D563263276B1BE7 }}
-          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_8C37ADE8455A4DD9906B0D3BA758C0C0 }}
-          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_1E7B67B862F34DFCB70E0476E3603942 }}
+          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_C6E2A2D873C240B2AA4B2906E95CBBB5 }}
+          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_0B1F002AF3EF47FE8C6F0DCC3A806C31 }}
+          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_20C0B34EAB70441DA76BD59981BA6296 }}
 
       - name: 'Deploy to Azure Web App'
         uses: azure/webapps-deploy@v3
         id: deploy-to-webapp
         with:
-          app-name: 'translate-bac'
+          app-name: 'web1-translate'
           slot-name: 'Production'
           
