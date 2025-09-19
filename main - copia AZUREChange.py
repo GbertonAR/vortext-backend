@@ -4,6 +4,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 import asyncio
 import azure.cognitiveservices.speech as speechsdk
+import sounddevice as sd
+import numpy as np
 import os
 import base64
 from dotenv import load_dotenv
@@ -38,9 +40,11 @@ app.add_middleware(
 )
 
 translation_queue = asyncio.Queue()
-audio_queue = asyncio.Queue()
 connected_clients = set()
+
 audio_task_running = asyncio.Event()
+audio_processing_task_handle = None
+broadcast_translations_task_handle = None
 
 VOICE_MAP = {
     "es": "es-ES-ElviraNeural",
@@ -52,23 +56,27 @@ VOICE_MAP = {
 }
 
 CURRENT_TARGET_LANG = "es"
-CURRENT_INPUT_LANG = "en-US"
+CURRENT_INPUT_LANG = "en-US"  # por defecto
+
 
 async def save_translation_to_db(text: str):
     logger.info(f"💾 Guardando en la base de datos: {text}")
     await asyncio.sleep(0.05)
 
 
-async def audio_translation_task():
+async def audio_processing_task(timeout: int = 180):
     """
-    Recibe audio de la cola (proveniente del WebSocket del cliente),
-    lo envía a Azure STT+Translation y publica traducciones en la cola de traducciones.
+    Captura audio del micrófono del servidor, lo envía a Azure STT+Translation,
+    y publica traducciones en translation_queue.
     """
-    global CURRENT_TARGET_LANG, CURRENT_INPUT_LANG
-    logger.info("Iniciando tarea de traducción de audio...")
+    global audio_processing_task_handle, CURRENT_TARGET_LANG, CURRENT_INPUT_LANG
+    logger.info("Iniciando tarea de procesamiento de audio...")
 
+    loop = asyncio.get_running_loop()
+
+    # Definir formato explícito
     stream_format = speechsdk.audio.AudioStreamFormat(
-        samples_per_second=SAMPLE_RATE, bits_per_sample=16, channels=CHANNELS
+        samples_per_second=16000, bits_per_sample=16, channels=1
     )
     push_stream = speechsdk.audio.PushAudioInputStream(stream_format=stream_format)
     audio_config = speechsdk.audio.AudioConfig(stream=push_stream)
@@ -86,7 +94,7 @@ async def audio_translation_task():
     def recognizing_cb(evt):
         if evt.result.text:
             logger.info(f"[Parcial]: {evt.result.text}")
-            
+
     def recognized_cb(evt):
         try:
             text = evt.result.translations.get(CURRENT_TARGET_LANG, "")
@@ -94,7 +102,7 @@ async def audio_translation_task():
             text = ""
         if text:
             logger.info(f"✅ Traducción reconocida ({CURRENT_TARGET_LANG}): {text}")
-            asyncio.create_task(translation_queue.put(text))
+            loop.call_soon_threadsafe(translation_queue.put_nowait, text)
 
     def canceled_cb(evt):
         logger.info("Recognizer canceled:", evt)
@@ -104,28 +112,46 @@ async def audio_translation_task():
     recognizer.canceled.connect(canceled_cb)
 
     recognizer.start_continuous_recognition()
-    
     try:
-        logger.info("📡 Escuchando flujo de audio del cliente...")
+        logger.info("🎤 Escuchando micrófono (servidor)...")
         await broadcast_status("Activo")
-        while audio_task_running.is_set():
-            audio_data = await audio_queue.get()
-            if audio_data is None:
-                continue
-            
-            push_stream.write(audio_data)
-            audio_queue.task_done()
-            
+        last_audio_time = asyncio.get_event_loop().time()
+        with sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=DTYPE) as stream:
+            while audio_task_running.is_set():
+                data, _ = stream.read(SAMPLE_RATE // 10)
+                if np.any(data):
+                    try:
+                        push_stream.write(data.tobytes())
+                        # nivel RMS para animación
+                        level = int(np.sqrt(np.mean(data.astype(np.float32) ** 2)) * 1000)
+                        await broadcast_status("Activo", level=level)
+                    except Exception as e:
+                        logger.warning("Error escribiendo al PushAudioInputStream:", e)
+                    last_audio_time = asyncio.get_event_loop().time()
+                elif asyncio.get_event_loop().time() - last_audio_time > timeout:
+                    logger.info("⏰ Timeout de audio, deteniendo.")
+                    audio_task_running.clear()
+                    break
+                await asyncio.sleep(0.01)
     except Exception as e:
-        logger.error("❌ Error en el procesador de audio:", e)
+        logger.error("❌ Error en captura/recognizer:", e)
         await broadcast_status("Error")
     finally:
-        push_stream.close()
-        recognizer.stop_continuous_recognition()
-        logger.info("⚠️ Tarea de traducción de audio finalizada.")
+        try:
+            push_stream.close()
+        except Exception:
+            pass
+        try:
+            recognizer.stop_continuous_recognition()
+        except Exception:
+            pass
+        logger.info("⚠️ Tarea de procesamiento finalizada.")
         await broadcast_status("Detenido")
+        audio_processing_task_handle = None
+
 
 async def broadcast_translations():
+    global broadcast_translations_task_handle, CURRENT_TARGET_LANG
     logger.info("[DEBUG] Tarea de broadcast iniciada.")
     while True:
         text = await translation_queue.get()
@@ -164,8 +190,10 @@ async def broadcast_translations():
             await broadcast_status("Error")
         finally:
             translation_queue.task_done()
-            
+
+    broadcast_translations_task_handle = None
     logger.info("[DEBUG] Tarea broadcast finalizada.")
+
 
 async def broadcast_status(status: str, level: int = 0):
     for client in list(connected_clients):
@@ -174,26 +202,16 @@ async def broadcast_status(status: str, level: int = 0):
         except Exception:
             connected_clients.remove(client)
 
-@app.websocket("/ws/audio")
-async def audio_websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    logger.info("✅ Cliente de audio conectado.")
-    try:
-        while True:
-            audio_bytes = await websocket.receive_bytes()
-            await audio_queue.put(audio_bytes)
-    except WebSocketDisconnect:
-        logger.info("⚠️ Cliente de audio desconectado.")
 
 @app.websocket("/ws/live")
 async def websocket_endpoint(ws: WebSocket):
-    global audio_processing_task_handle
+    global audio_processing_task_handle, broadcast_translations_task_handle
     global CURRENT_TARGET_LANG, CURRENT_INPUT_LANG
     await ws.accept()
     connected_clients.add(ws)
-    logger.info(f"✅ Nuevo cliente de control conectado: {ws.client}. Total: {len(connected_clients)}")
+    logger.info(f"✅ Nuevo cliente conectado: {ws.client}. Total: {len(connected_clients)}")
 
-    await ws.send_json({"status": "Activo" if audio_task_running.is_set() else "Detenido"})
+    await ws.send_json({"status": "Activo" if audio_task_running.is_set() else "Detenido"})  # Se corrige "audio_task_running is_set()" a "audio_task_running.is_set()"
 
     try:
         while True:
@@ -210,8 +228,8 @@ async def websocket_endpoint(ws: WebSocket):
                     CURRENT_INPUT_LANG = input_lang
                 if not audio_task_running.is_set():
                     audio_task_running.set()
-                    asyncio.create_task(audio_translation_task())
-                    asyncio.create_task(broadcast_translations())
+                    audio_processing_task_handle = asyncio.create_task(audio_processing_task())
+                    broadcast_translations_task_handle = asyncio.create_task(broadcast_translations())
                 await ws.send_json({"status": "Activo"})
 
             elif command == "stop_translation":
@@ -219,10 +237,11 @@ async def websocket_endpoint(ws: WebSocket):
                 await ws.send_json({"status": "Detenido"})
 
     except WebSocketDisconnect:
-        logger.info(f"⚠️ Cliente de control {ws.client} se desconectó.")
+        logger.info(f"⚠️ Cliente {ws.client} se desconectó.")
     finally:
         connected_clients.remove(ws)
-        logger.info(f"Cliente de control desconectado. Restan: {len(connected_clients)}")
+        logger.info(f"Cliente desconectado. Restan: {len(connected_clients)}")
+
 
 # Endpoint web
 @app.get("/", response_class=HTMLResponse)
@@ -235,10 +254,10 @@ def root():
         <title>Vortex Live Translation</title>
         <style>
             body { font-family: Arial, sans-serif; background-color: #f4f6f8; color: #333;
-                   display: flex; flex-direction: column; justify-content: center; align-items: center; 
-                   height: 100vh; margin: 0; }
+                    display: flex; flex-direction: column; justify-content: center; align-items: center; 
+                    height: 100vh; margin: 0; }
             .container { text-align: center; background: white; padding: 2rem 3rem; border-radius: 12px;
-                         box-shadow: 0 4px 12px rgba(0,0,0,0.1); width: 80%; max-width: 600px; }
+                            box-shadow: 0 4px 12px rgba(0,0,0,0.1); width: 80%; max-width: 600px; }
             h1 { color: #0078D7; }
             .status-line { display: flex; align-items: center; justify-content: center; margin-bottom: 1rem; }
             .status-dot { height: 20px; width: 20px; border-radius: 50%; margin-right: 10px; }
@@ -247,7 +266,7 @@ def root():
             .bar-container { height: 10px; width: 100%; background: #eee; border-radius: 5px; overflow: hidden; margin-top: 1rem; }
             .bar { height: 100%; background: #0078D7; transition: width 0.1s; }
             #translation-display { margin-top: 1.5rem; padding: 1rem; border: 1px solid #ddd;
-                                   border-radius: 8px; min-height: 100px; text-align: left; background-color: #f9f9f9; white-space: pre-wrap; }
+                                    border-radius: 8px; min-height: 100px; text-align: left; background-color: #f9f9f9; white-space: pre-wrap; }
             .button { padding: 10px 20px; font-size: 16px; cursor: pointer; border: none; border-radius: 5px; }
             .start-button { background-color: #2ecc71; color: white; }
             .stop-button { background-color: #e74c3c; color: white; }
@@ -281,7 +300,7 @@ def root():
     </body>
     </html>
     """
-    
+
 if __name__ == "__main__":
     try:
         import uvicorn
