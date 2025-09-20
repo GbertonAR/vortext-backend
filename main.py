@@ -16,9 +16,13 @@ import io
 app = FastAPI()
 
 # Añadir CORS
+# origins = [
+#     "http://localhost",
+#     "http://localhost:5173", # Reemplaza con la URL de tu frontend en producción
+#     "https://proud-dune-06afaf61e.1.azurestaticapps.net/",
+# ]
+
 origins = [
-    "http://localhost",
-    "http://localhost:5173", # Reemplaza con la URL de tu frontend en producción
     "https://proud-dune-06afaf61e.1.azurestaticapps.net/",
 ]
 
