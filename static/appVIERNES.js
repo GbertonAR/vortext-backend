@@ -26,7 +26,7 @@ function updateStatus(newStatus, level = 0) {
 function toggleTranslation() {
   const btn = document.getElementById("toggle-translation");
   if (!ws || ws.readyState !== WebSocket.OPEN) {
-    ws = new WebSocket(`wss://${window.location.host}/ws/live`);
+    ws = new WebSocket(`wss://${window.location.host}/ws/speaker`);
     ws.onopen = () => {
       const inputLang = document.getElementById("input-language").value;
       ws.send(JSON.stringify({ command: "start_translation", lang: "es", input_lang: inputLang }));
