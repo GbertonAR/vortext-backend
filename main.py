@@ -2,11 +2,12 @@ import os
 import json
 import asyncio
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
 from threading import Thread
 from fastapi.middleware.cors import CORSMiddleware
+
 
 import azure.cognitiveservices.speech as speechsdk
 from azure.cognitiveservices.speech import speech
@@ -23,7 +24,7 @@ app = FastAPI()
 # ]
 
 origins = [
-    "https://proud-dune-06afaf61e.1.azurestaticapps.net/",
+    "https://proud-dune-06afaf61e.1.azurestaticapps.net",
 ]
 
 app.add_middleware(
@@ -248,6 +249,24 @@ def root():
     </html>
     """
 
+# @app.post("/configure")
+# async def configure(request: Request):
+#     global is_processing, input_lang, storage_method
+#     form_data = await request.form()
+#     action = form_data.get("action")
+
+#     if action == "start":
+#         input_lang = form_data.get("input_lang")
+#         storage_method = form_data.get("storage_method")
+#         is_processing = True
+#         print(f"Servicio iniciado. Orador: {input_lang}, Almacenamiento: {storage_method}")
+#     elif action == "stop":
+#         is_processing = False
+#         print("Servicio detenido por el operador.")
+
+#     return RedirectResponse(url="/", status_code=303)
+
+
 @app.post("/configure")
 async def configure(request: Request):
     global is_processing, input_lang, storage_method
@@ -259,11 +278,16 @@ async def configure(request: Request):
         storage_method = form_data.get("storage_method")
         is_processing = True
         print(f"Servicio iniciado. Orador: {input_lang}, Almacenamiento: {storage_method}")
+        return JSONResponse({"status": "started", "input_lang": input_lang, "storage_method": storage_method})
+
     elif action == "stop":
         is_processing = False
         print("Servicio detenido por el operador.")
+        return JSONResponse({"status": "stopped"})
 
-    return RedirectResponse(url="/", status_code=303)
+    # si no hay action
+    return JSONResponse({"status": "unknown action"}, status_code=400)
+
 
 if __name__ == "__main__": 
     print("Iniciando servidor Uvicorn...")
