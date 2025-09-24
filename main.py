@@ -12,7 +12,7 @@ import time
 app = FastAPI()
 
 origins = [
-    "http://localhost:5173",
+    "https://proud-dune-06afaf61e.1.azurestaticapps.net/",
 ]
 
 app.add_middleware(
