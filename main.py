@@ -2,29 +2,17 @@ import os
 import json
 import asyncio
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
-from dotenv import load_dotenv
-from threading import Thread
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-
-
+from threading import Thread
+from dotenv import load_dotenv
 import azure.cognitiveservices.speech as speechsdk
-from azure.cognitiveservices.speech import speech
-
-import io
+import time
 
 app = FastAPI()
 
-# Añadir CORS
-# origins = [
-#     "http://localhost",
-#     "http://localhost:5173", # Reemplaza con la URL de tu frontend en producción
-#     "https://proud-dune-06afaf61e.1.azurestaticapps.net/",
-# ]
-
 origins = [
-    "https://proud-dune-06afaf61e.1.azurestaticapps.net",
+    "http://localhost:5173",
 ]
 
 app.add_middleware(
@@ -35,261 +23,271 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-# Mapeo de oyentes por idioma
-listeners = {}
-
-# Variables de estado globales
-is_processing = False
-input_lang = "en-US"  # Idioma del orador por defecto
-storage_method = "NO_RECORD"
+# --- Estado por sala ---
+rooms = {}  # room_id: { "listeners": {lang: [websockets]}, "input_lang": str, "push_stream": obj, "translator": obj, "storage_method": str, "start_time": float, "speaker_count": int, "last_text": str }
 
 # Cargar .env
-print("Cargando variables de entorno desde .env...")
 load_dotenv()
-print("Variables de entorno cargadas.")
-
-# Variables de entorno para las credenciales de Azure
 SPEECH_KEY = os.getenv("SPEECH_KEY")
 SPEECH_REGION = os.getenv("SPEECH_REGION")
 
-# Log para verificar las variables de entorno
-print(f"AZURE_SPEECH_KEY cargada: {'Sí' if SPEECH_KEY else 'No'}")
-print(f"AZURE_SPEECH_REGION cargada: {'Sí' if SPEECH_REGION else 'No'}")
+print(f"Azure Key: {'Sí' if SPEECH_KEY else 'No'}, Region: {'Sí' if SPEECH_REGION else 'No'}")
 
-# Configuración del servicio de voz de Azure
-try:
-    speech_translation_config = speechsdk.translation.SpeechTranslationConfig(
-        subscription=SPEECH_KEY,
-        region=SPEECH_REGION
-    )
-    print("Configuración de Azure SpeechTranslationConfig exitosa.")
-except Exception as e:
-    print(f"ERROR: No se pudo configurar Azure Speech. Revisa tus credenciales. {e}")
-
-speech_translation_config.set_property(
-    speechsdk.PropertyId.SpeechServiceConnection_InitialSilenceTimeoutMs, "500"
-)
-
-# Endpoint para el orador
-@app.websocket("/ws/speaker")
-async def websocket_speaker(websocket: WebSocket):
+# --- WebSocket Orador ---
+@app.websocket("/ws/speaker/{room_id}")
+async def websocket_speaker(websocket: WebSocket, room_id: str):
     await websocket.accept()
-    print("✨ Orador conectado.")
+    print(f"✨ Orador conectado a la sala {room_id}")
 
-    # Variables globales (considera pasarlas como parámetros en el futuro)
-    global is_processing, input_lang, storage_method, listeners, SPEECH_KEY, SPEECH_REGION
+    loop = asyncio.get_running_loop()
 
-    if not is_processing:
-        await websocket.send_text("Servicio de traducción no iniciado.")
-        await websocket.close()
-        return
+    if room_id not in rooms:
+        rooms[room_id] = {
+            "listeners": {},
+            "input_lang": "en-US",
+            "push_stream": None,
+            "translator": None,
+            "storage_method": "NO_RECORD",
+            "start_time": time.time(),
+            "speaker_count": 0,
+            "last_text": ""
+        }
 
-    # ✅ Configurar el formato de audio solo UNA vez
-    audio_format = speechsdk.audio.AudioStreamFormat(
-        samples_per_second=16000,
-        bits_per_sample=16,
-        channels=1
-    )
+    rooms[room_id]["speaker_count"] += 1
+    rooms[room_id]["start_time"] = time.time()  # nueva conexión reinicia el tiempo
+
+    # Audio config
+    audio_format = speechsdk.audio.AudioStreamFormat(samples_per_second=16000, bits_per_sample=16, channels=1)
     push_stream = speechsdk.audio.PushAudioInputStream(stream_format=audio_format)
     audio_config = speechsdk.audio.AudioConfig(stream=push_stream)
 
-    # ✅ Configurar SpeechTranslationConfig
-    speech_translation_config = speechsdk.translation.SpeechTranslationConfig(
-        subscription=SPEECH_KEY,
-        region=SPEECH_REGION
-    )
-
-    # Configurar idioma de reconocimiento
-    speech_translation_config.speech_recognition_language = input_lang
-    print(f"Idioma del orador configurado: {input_lang}")
-
-    # Configurar idiomas de traducción
-    target_languages = ["es", "en", "fr", "it", "de", "pt"]
+    # SpeechTranslationConfig
+    speech_translation_config = speechsdk.translation.SpeechTranslationConfig(subscription=SPEECH_KEY, region=SPEECH_REGION)
+    speech_translation_config.speech_recognition_language = rooms[room_id]["input_lang"]
+    target_languages = ["es", "en", "fr", "it", "de", "pt", "zh-Hans"]
     for lang in target_languages:
         speech_translation_config.add_target_language(lang)
 
-    # ✅ Crear TranslationRecognizer
     translator = speechsdk.translation.TranslationRecognizer(
         translation_config=speech_translation_config,
         audio_config=audio_config
     )
 
-    # ✅ Obtener loop actual para callbacks
-    loop = asyncio.get_running_loop()
+    rooms[room_id]["push_stream"] = push_stream
+    rooms[room_id]["translator"] = translator
 
-    # ✅ Función para enviar traducciones a los oyentes
+    # --- Función para enviar traducciones finales ---
     def send_translation_to_listeners(result_event):
-        print(f"Evento de traducción: '{result_event.result_id}'")
-        print(f"Texto reconocido: '{result_event.text}'")
-        print(f"Traducciones: {result_event.translations}")
-
         translations = result_event.translations
-        original_text = result_event.text
+        original_text = result_event.text.strip()
+
+        # Evitar duplicados
+        if original_text == rooms[room_id].get("last_text", ""):
+            return
+        rooms[room_id]["last_text"] = original_text
 
         for lang, translated_text in translations.items():
-            if lang in listeners:
+            if lang in rooms[room_id]["listeners"]:
                 message = {
                     "original_text": original_text,
                     "translated_text": translated_text,
                     "audio_url": ""
                 }
-                for client in listeners[lang]:
+                for client in rooms[room_id]["listeners"][lang]:
                     try:
-                        asyncio.run_coroutine_threadsafe(
-                            client.send_json(message), loop
-                        )
-                        print(f"Mensaje enviado a oyente en idioma {lang}.")
+                        asyncio.run_coroutine_threadsafe(client.send_json(message), loop)
                     except Exception as e:
-                        print(f"ERROR al enviar mensaje a oyente en {lang}: {e}")
+                        print(f"Error enviando a oyente en {lang}: {e}")
 
-    # ✅ Conectar eventos del traductor
     translator.recognized.connect(lambda evt: send_translation_to_listeners(evt.result))
-    translator.recognizing.connect(lambda evt: print(f"Parcial: {evt.result.text}"))
+    translator.recognizing.connect(lambda evt: print(f"Parcial: {evt.result.text}"))  # solo consola
 
-    print("Iniciando reconocimiento continuo de Azure...")
     translation_thread = Thread(target=lambda: translator.start_continuous_recognition_async().get())
     translation_thread.start()
-    print("Reconocimiento continuo iniciado.")
+    print(f"Reconocimiento iniciado en sala {room_id}")
 
     try:
         while True:
             audio_data = await websocket.receive_bytes()
-            if audio_data:
-                #print(f"✅ Audio recibido del orador. Tamaño: {len(audio_data)} bytes.")
-
-                if storage_method == "NO_RECORD":
-                    push_stream.write(audio_data)
-                else:
-                    print(f"⚠️ Método de almacenamiento {storage_method} no implementado. Ignorando audio.")
-
+            if audio_data and rooms[room_id]["storage_method"] == "NO_RECORD":
+                push_stream.write(audio_data)
     except WebSocketDisconnect:
-        print("❌ Orador desconectado.")
+        print(f"Orador desconectado de sala {room_id}")
     finally:
-        print("Deteniendo reconocimiento continuo de Azure...")
         push_stream.close()
         translator.stop_continuous_recognition_async().get()
         translation_thread.join()
+        rooms[room_id]["translator"] = None
+        rooms[room_id]["push_stream"] = None
+        rooms[room_id]["last_text"] = ""  # <--- Limpiar buffer al desconectar
+        rooms[room_id]["speaker_count"] -= 1
+        if rooms[room_id]["speaker_count"] < 0:
+            rooms[room_id]["speaker_count"] = 0
         await websocket.close()
-        print("Reconocimiento continuo detenido y WebSocket cerrado.")
-        
-        
-# Endpoint para los oyentes
-@app.websocket("/ws/listener")
-async def websocket_listener(websocket: WebSocket, lang: str):
+        print(f"Reconocimiento detenido en sala {room_id}")
+
+# --- WebSocket Oyente ---
+@app.websocket("/ws/listener/{room_id}")
+async def websocket_listener(websocket: WebSocket, room_id: str, lang: str):
     await websocket.accept()
-    if lang not in listeners:
-        listeners[lang] = []
-    listeners[lang].append(websocket)
-    print(f"👂 Oyente conectado. Idioma: {lang}. Total oyentes: {len(listeners[lang])}")
+    if room_id not in rooms:
+        rooms[room_id] = {
+            "listeners": {},
+            "input_lang": "en-US",
+            "push_stream": None,
+            "translator": None,
+            "storage_method": "NO_RECORD",
+            "start_time": time.time(),
+            "speaker_count": 0,
+            "last_text": ""
+        }
+    if lang not in rooms[room_id]["listeners"]:
+        rooms[room_id]["listeners"][lang] = []
+    rooms[room_id]["listeners"][lang].append(websocket)
+    print(f"👂 Oyente conectado a sala {room_id}, idioma {lang}")
 
     try:
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
-        if websocket in listeners[lang]:
-            listeners[lang].remove(websocket)
-            print(f"🚪 Oyente desconectado. Idioma: {lang}. Oyentes restantes: {len(listeners[lang])}")
-            if not listeners[lang]:
-                del listeners[lang]
-                print(f"🚫 No quedan oyentes para el idioma {lang}. Eliminando la clave.")
+        rooms[room_id]["listeners"][lang].remove(websocket)
+        print(f"🚪 Oyente desconectado de sala {room_id}, idioma {lang}")
+        if not rooms[room_id]["listeners"][lang]:
+            del rooms[room_id]["listeners"][lang]
 
+# --- Configuración sala ---
+@app.post("/configure/{room_id}")
+async def configure_room(room_id: str, request: Request):
+    form_data = await request.form()
+    action = form_data.get("action")
+    input_lang = form_data.get("input_lang")
+    storage_method = form_data.get("storage_method")
+
+    if room_id not in rooms:
+        rooms[room_id] = {
+            "listeners": {},
+            "input_lang": input_lang,
+            "push_stream": None,
+            "translator": None,
+            "storage_method": storage_method,
+            "start_time": time.time(),
+            "speaker_count": 0,
+            "last_text": ""
+        }
+    else:
+        rooms[room_id]["input_lang"] = input_lang
+        rooms[room_id]["storage_method"] = storage_method
+        rooms[room_id]["start_time"] = time.time()  # reinicio del tiempo al configurar
+
+    return JSONResponse({"status": action, "room_id": room_id, "input_lang": input_lang, "storage_method": storage_method})
+
+# --- Endpoint estadísticas ---
+@app.get("/stats")
+async def stats():
+    now = time.time()
+    stats_data = []
+    for room_id, info in rooms.items():
+        oyentes_total = sum(len(clients) for clients in info["listeners"].values())
+        tiempo = int(now - info.get("start_time", now))
+        stats_data.append({
+            "sala": room_id,
+            "oradores": info.get("speaker_count", 0),
+            "oyentes": oyentes_total,
+            "tiempo_segundos": tiempo
+        })
+    return JSONResponse(stats_data)
+
+# --- Página principal ---
 @app.get("/", response_class=HTMLResponse)
 def root():
-    global is_processing, input_lang, storage_method
-    status = "Activo" if is_processing else "Detenido"
-    return f"""
+    html_content = """
     <!doctype html>
     <html>
       <head>
         <meta charset="utf-8"/>
-        <title>Vortex Live Translation - Configuración</title>
+        <title>Vortex Live Translation - Multi-sala</title>
         <style>
-            body {{ font-family: Arial, sans-serif; background-color: #f4f6f8; color: #333; padding: 20px; }}
-            .container {{ max-width: 600px; margin: auto; background: white; padding: 2rem; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }}
-            h2, h3 {{ color: #0078D7; }}
-            label {{ font-weight: bold; margin-top: 10px; display: block; }}
-            select, button {{ width: 100%; padding: 10px; margin-top: 5px; border-radius: 5px; border: 1px solid #ccc; }}
-            button {{ background-color: #0078D7; color: white; cursor: pointer; }}
-            .status {{ margin-top: 20px; padding: 10px; background-color: #e0e0e0; border-radius: 5px; }}
-            .active {{ background-color: #d4edda; color: #155724; }}
-            .inactive {{ background-color: #f8d7da; color: #721c24; }}
+            body { font-family: Arial; background-color: #f4f6f8; color: #333; padding: 20px; }
+            .container { max-width: 600px; margin: auto; background: white; padding: 2rem; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
+            h2 { color: #0078D7; }
+            label { font-weight: bold; margin-top: 10px; display: block; }
+            select, button, input { width: 100%; padding: 10px; margin-top: 5px; border-radius: 5px; border: 1px solid #ccc; }
+            button { background-color: #0078D7; color: white; cursor: pointer; }
+            .status { margin-top: 20px; padding: 10px; background-color: #e0e0e0; border-radius: 5px; }
+            .active { background-color: #d4edda; color: #155724; }
+            .inactive { background-color: #f8d7da; color: #721c24; }
+            .stats { margin-top: 20px; background: #f9f9f9; padding: 10px; border-radius: 5px; font-size: 14px; }
         </style>
       </head>
       <body>
         <div class="container">
-          <h2>Panel de Operador - Vortex Live Translation</h2>
-          <div class="status {'active' if is_processing else 'inactive'}">
-            <p><strong>Estado del servicio:</strong> {status}</p>
-            <p><strong>Idioma del orador:</strong> {input_lang}</p>
-            <p><strong>Método de almacenamiento:</strong> {storage_method}</p>
+          <h2>Panel de Operador - Multi-sala</h2>
+          <label for="room_id">ID de la sala:</label>
+          <input type="text" id="room_id" placeholder="Sala1"/>
+
+          <label for="input_lang">Idioma del orador:</label>
+          <select id="input_lang">
+            <option value="es-ES">Español</option>
+            <option value="en-US">Inglés</option>
+            <option value="fr-FR">Francés</option>
+            <option value="it-IT">Italiano</option>
+            <option value="de-DE">Alemán</option>
+            <option value="pt-PT">Portugués</option>
+            <option value="zh-CN">Chino</option>
+          </select>
+
+          <label for="storage_method">Método de almacenamiento:</label>
+          <select id="storage_method">
+            <option value="NO_RECORD">Procesar en memoria (sin grabación)</option>
+            <option value="LOCAL_RECORD" disabled>Grabar localmente (no implementado)</option>
+          </select>
+
+          <button onclick="configureRoom('start')" style="background-color: #2ecc71;">Iniciar Traducción</button>
+          <button onclick="configureRoom('stop')" style="background-color: #e74c3c;">Detener Traducción</button>
+
+          <div id="status" class="status inactive">Estado: Detenido</div>
+
+          <div class="stats">
+            <h3>📊 Estadísticas</h3>
+            <div id="statsContent">Sin datos</div>
           </div>
-          <form action="/configure" method="post">
-            <label for="input_lang">Idioma del orador:</label>
-            <select name="input_lang" id="input_lang">
-              <option value="es-ES" {'selected' if input_lang == "es-ES" else ''}>Español</option>
-              <option value="en-US" {'selected' if input_lang == "en-US" else ''}>Inglés</option>
-              <option value="fr-FR" {'selected' if input_lang == "fr-FR" else ''}>Francés</option>
-              <option value="it-IT" {'selected' if input_lang == "it-IT" else ''}>Italiano</option>
-              <option value="de-DE" {'selected' if input_lang == "de-DE" else ''}>Alemán</option>
-              <option value="pt-PT" {'selected' if input_lang == "pt-PT" else ''}>Portugués</option>
-            </select>
-            <br>
-            <label for="storage_method">Método de almacenamiento:</label>
-            <select name="storage_method" id="storage_method">
-              <option value="NO_RECORD" {'selected' if storage_method == "NO_RECORD" else ''}>Procesar en memoria (sin grabación)</option>
-              <option value="LOCAL_RECORD" {'selected' if storage_method == "LOCAL_RECORD" else ''} disabled>Grabar localmente (no implementado)</option>
-            </select>
-            <br>
-            <button type="submit" name="action" value="start" style="background-color: #2ecc71;">Iniciar Traducción</button>
-            <button type="submit" name="action" value="stop" style="background-color: #e74c3c;">Detener Traducción</button>
-          </form>
         </div>
+
+        <script>
+        async function configureRoom(action){
+            const room_id = document.getElementById('room_id').value || 'Sala1';
+            const input_lang = document.getElementById('input_lang').value;
+            const storage_method = document.getElementById('storage_method').value;
+
+            const formData = new FormData();
+            formData.append('action', action);
+            formData.append('input_lang', input_lang);
+            formData.append('storage_method', storage_method);
+
+            const res = await fetch(`/configure/${room_id}`, { method: 'POST', body: formData });
+            const data = await res.json();
+            document.getElementById('status').textContent = `Estado: ${action.toUpperCase()} (Sala: ${room_id}, Idioma: ${input_lang})`;
+            document.getElementById('status').className = action === 'start' ? 'status active' : 'status inactive';
+        }
+
+        async function loadStats(){
+            const res = await fetch('/stats');
+            const data = await res.json();
+            let html = '';
+            data.forEach(item => {
+                html += `<p><strong>Sala:</strong> ${item.sala} | <strong>Oradores:</strong> ${item.oradores} | <strong>Oyentes:</strong> ${item.oyentes} | <strong>Tiempo:</strong> ${item.tiempo_segundos} seg</p>`;
+            });
+            if(html==='') html = 'Sin datos';
+            document.getElementById('statsContent').innerHTML = html;
+        }
+
+        setInterval(loadStats, 3000); // refresca cada 3 segundos
+        </script>
       </body>
     </html>
     """
+    return HTMLResponse(content=html_content)
 
-# @app.post("/configure")
-# async def configure(request: Request):
-#     global is_processing, input_lang, storage_method
-#     form_data = await request.form()
-#     action = form_data.get("action")
-
-#     if action == "start":
-#         input_lang = form_data.get("input_lang")
-#         storage_method = form_data.get("storage_method")
-#         is_processing = True
-#         print(f"Servicio iniciado. Orador: {input_lang}, Almacenamiento: {storage_method}")
-#     elif action == "stop":
-#         is_processing = False
-#         print("Servicio detenido por el operador.")
-
-#     return RedirectResponse(url="/", status_code=303)
-
-
-@app.post("/configure")
-async def configure(request: Request):
-    global is_processing, input_lang, storage_method
-    form_data = await request.form()
-    action = form_data.get("action")
-
-    if action == "start":
-        input_lang = form_data.get("input_lang")
-        storage_method = form_data.get("storage_method")
-        is_processing = True
-        print(f"Servicio iniciado. Orador: {input_lang}, Almacenamiento: {storage_method}")
-        return JSONResponse({"status": "started", "input_lang": input_lang, "storage_method": storage_method})
-
-    elif action == "stop":
-        is_processing = False
-        print("Servicio detenido por el operador.")
-        return JSONResponse({"status": "stopped"})
-
-    # si no hay action
-    return JSONResponse({"status": "unknown action"}, status_code=400)
-
-
-if __name__ == "__main__": 
-    print("Iniciando servidor Uvicorn...")
+if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
