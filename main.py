@@ -12,8 +12,9 @@ import time
 app = FastAPI()
 
 origins = [
-    "https://proud-dune-06afaf61e.1.azurestaticapps.net/",
+    "https://proud-dune-06afaf61e.1.azurestaticapps.net",
 ]
+
 
 app.add_middleware(
     CORSMiddleware,
