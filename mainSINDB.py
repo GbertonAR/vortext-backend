@@ -1,26 +1,20 @@
 import os
 import json
 import asyncio
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, UploadFile, File, Form
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, Response
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from threading import Thread
 from dotenv import load_dotenv
 import azure.cognitiveservices.speech as speechsdk
 import time
-import tempfile
 
 app = FastAPI()
 
-# Ajusta orígenes según tu frontend
-# origins = [
-#     "https://proud-dune-06afaf61e.1.azurestaticapps.net",
-# ]
-
-
 origins = [
-    "http://localhost:5173",
+    "https://proud-dune-06afaf61e.1.azurestaticapps.net",
 ]
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -31,20 +25,7 @@ app.add_middleware(
 )
 
 # --- Estado por sala ---
-# Cada sala tendrá:
-# {
-#   "listeners": { lang: [websockets] },
-#   "input_lang": "en-US",
-#   "push_stream": obj,
-#   "translator": obj,
-#   "storage_method": str,
-#   "start_time": float,
-#   "speaker_count": int,
-#   "last_text": str,
-#   "transcript_original": [ "segment 1", "segment 2", ... ],
-#   "translations": { "es": ["seg1","seg2"], "en": [...] }
-# }
-rooms = {}
+rooms = {}  # room_id: { "listeners": {lang: [websockets]}, "input_lang": str, "push_stream": obj, "translator": obj, "storage_method": str, "start_time": float, "speaker_count": int, "last_text": str }
 
 # Cargar .env
 load_dotenv()
@@ -52,23 +33,6 @@ SPEECH_KEY = os.getenv("SPEECH_KEY")
 SPEECH_REGION = os.getenv("SPEECH_REGION")
 
 print(f"Azure Key: {'Sí' if SPEECH_KEY else 'No'}, Region: {'Sí' if SPEECH_REGION else 'No'}")
-
-
-def ensure_room(room_id: str, input_lang: str = "en-US", storage_method: str = "NO_RECORD"):
-    if room_id not in rooms:
-        rooms[room_id] = {
-            "listeners": {},
-            "input_lang": input_lang,
-            "push_stream": None,
-            "translator": None,
-            "storage_method": storage_method,
-            "start_time": time.time(),
-            "speaker_count": 0,
-            "last_text": "",
-            "transcript_original": [],
-            "translations": {}
-        }
-
 
 # --- WebSocket Orador ---
 @app.websocket("/ws/speaker/{room_id}")
@@ -78,9 +42,20 @@ async def websocket_speaker(websocket: WebSocket, room_id: str):
 
     loop = asyncio.get_running_loop()
 
-    ensure_room(room_id)
+    if room_id not in rooms:
+        rooms[room_id] = {
+            "listeners": {},
+            "input_lang": "en-US",
+            "push_stream": None,
+            "translator": None,
+            "storage_method": "NO_RECORD",
+            "start_time": time.time(),
+            "speaker_count": 0,
+            "last_text": ""
+        }
+
     rooms[room_id]["speaker_count"] += 1
-    rooms[room_id]["start_time"] = time.time()
+    rooms[room_id]["start_time"] = time.time()  # nueva conexión reinicia el tiempo
 
     # Audio config
     audio_format = speechsdk.audio.AudioStreamFormat(samples_per_second=16000, bits_per_sample=16, channels=1)
@@ -89,7 +64,7 @@ async def websocket_speaker(websocket: WebSocket, room_id: str):
 
     # SpeechTranslationConfig
     speech_translation_config = speechsdk.translation.SpeechTranslationConfig(subscription=SPEECH_KEY, region=SPEECH_REGION)
-    speech_translation_config.speech_recognition_language = rooms[room_id].get("input_lang", "en-US")
+    speech_translation_config.speech_recognition_language = rooms[room_id]["input_lang"]
     target_languages = ["es", "en", "fr", "it", "de", "pt", "zh-Hans"]
     for lang in target_languages:
         speech_translation_config.add_target_language(lang)
@@ -104,47 +79,31 @@ async def websocket_speaker(websocket: WebSocket, room_id: str):
 
     # --- Función para enviar traducciones finales ---
     def send_translation_to_listeners(result_event):
-        try:
-            translations = result_event.translations
-            original_text = (result_event.text or "").strip()
-            if not original_text:
-                return
+        translations = result_event.translations
+        original_text = result_event.text.strip()
 
-            # Evitar duplicados por el mismo resultado
-            if original_text == rooms[room_id].get("last_text", ""):
-                return
-            rooms[room_id]["last_text"] = original_text
+        # Evitar duplicados
+        if original_text == rooms[room_id].get("last_text", ""):
+            return
+        rooms[room_id]["last_text"] = original_text
 
-            # Guardar original
-            rooms[room_id]["transcript_original"].append(original_text)
-
-            # Guardar traducciones por idioma y enviar a oyentes
-            for lang, translated_text in translations.items():
-                if translated_text is None:
-                    continue
-                # inicializar lista de traducciones
-                rooms[room_id]["translations"].setdefault(lang, []).append(translated_text)
-
-                # construir mensaje
+        for lang, translated_text in translations.items():
+            if lang in rooms[room_id]["listeners"]:
                 message = {
                     "original_text": original_text,
                     "translated_text": translated_text,
                     "audio_url": ""
                 }
-                # enviar solo a oyentes interesados en ese idioma
-                if lang in rooms[room_id]["listeners"]:
-                    for client in list(rooms[room_id]["listeners"][lang]):
-                        try:
-                            asyncio.run_coroutine_threadsafe(client.send_json(message), loop)
-                        except Exception as e:
-                            print(f"Error enviando a oyente en {lang}: {e}")
-        except Exception as e:
-            print("Error en send_translation_to_listeners:", e)
+                for client in rooms[room_id]["listeners"][lang]:
+                    try:
+                        asyncio.run_coroutine_threadsafe(client.send_json(message), loop)
+                    except Exception as e:
+                        print(f"Error enviando a oyente en {lang}: {e}")
 
     translator.recognized.connect(lambda evt: send_translation_to_listeners(evt.result))
     translator.recognizing.connect(lambda evt: print(f"Parcial: {evt.result.text}"))  # solo consola
 
-    translation_thread = Thread(target=lambda: translator.start_continuous_recognition_async().get(), daemon=True)
+    translation_thread = Thread(target=lambda: translator.start_continuous_recognition_async().get())
     translation_thread.start()
     print(f"Reconocimiento iniciado en sala {room_id}")
 
@@ -156,33 +115,33 @@ async def websocket_speaker(websocket: WebSocket, room_id: str):
     except WebSocketDisconnect:
         print(f"Orador desconectado de sala {room_id}")
     finally:
-        try:
-            push_stream.close()
-        except Exception:
-            pass
-        try:
-            translator.stop_continuous_recognition_async().get()
-        except Exception:
-            pass
-        translation_thread.join(timeout=1)
+        push_stream.close()
+        translator.stop_continuous_recognition_async().get()
+        translation_thread.join()
         rooms[room_id]["translator"] = None
         rooms[room_id]["push_stream"] = None
-        # NOTA: no eliminamos el transcript para que pueda exportarse luego
+        rooms[room_id]["last_text"] = ""  # <--- Limpiar buffer al desconectar
         rooms[room_id]["speaker_count"] -= 1
         if rooms[room_id]["speaker_count"] < 0:
             rooms[room_id]["speaker_count"] = 0
         await websocket.close()
         print(f"Reconocimiento detenido en sala {room_id}")
 
-
 # --- WebSocket Oyente ---
 @app.websocket("/ws/listener/{room_id}")
-async def websocket_listener(websocket: WebSocket, room_id: str):
-    # NOTE: listener passes lang via query param ?lang=es
+async def websocket_listener(websocket: WebSocket, room_id: str, lang: str):
     await websocket.accept()
-    params = websocket.query_params
-    lang = params.get("lang", "es")
-    ensure_room(room_id)
+    if room_id not in rooms:
+        rooms[room_id] = {
+            "listeners": {},
+            "input_lang": "en-US",
+            "push_stream": None,
+            "translator": None,
+            "storage_method": "NO_RECORD",
+            "start_time": time.time(),
+            "speaker_count": 0,
+            "last_text": ""
+        }
     if lang not in rooms[room_id]["listeners"]:
         rooms[room_id]["listeners"][lang] = []
     rooms[room_id]["listeners"][lang].append(websocket)
@@ -190,33 +149,38 @@ async def websocket_listener(websocket: WebSocket, room_id: str):
 
     try:
         while True:
-            # el cliente puede enviar pings o comandos, aquí solo recibimos y descartamos
             await websocket.receive_text()
     except WebSocketDisconnect:
-        try:
-            rooms[room_id]["listeners"][lang].remove(websocket)
-        except Exception:
-            pass
+        rooms[room_id]["listeners"][lang].remove(websocket)
         print(f"🚪 Oyente desconectado de sala {room_id}, idioma {lang}")
-        if not rooms[room_id]["listeners"].get(lang):
-            rooms[room_id]["listeners"].pop(lang, None)
-
+        if not rooms[room_id]["listeners"][lang]:
+            del rooms[room_id]["listeners"][lang]
 
 # --- Configuración sala ---
 @app.post("/configure/{room_id}")
 async def configure_room(room_id: str, request: Request):
     form_data = await request.form()
     action = form_data.get("action")
-    input_lang = form_data.get("input_lang") or "en-US"
-    storage_method = form_data.get("storage_method") or "NO_RECORD"
+    input_lang = form_data.get("input_lang")
+    storage_method = form_data.get("storage_method")
 
-    ensure_room(room_id)
-    rooms[room_id]["input_lang"] = input_lang
-    rooms[room_id]["storage_method"] = storage_method
-    rooms[room_id]["start_time"] = time.time()
+    if room_id not in rooms:
+        rooms[room_id] = {
+            "listeners": {},
+            "input_lang": input_lang,
+            "push_stream": None,
+            "translator": None,
+            "storage_method": storage_method,
+            "start_time": time.time(),
+            "speaker_count": 0,
+            "last_text": ""
+        }
+    else:
+        rooms[room_id]["input_lang"] = input_lang
+        rooms[room_id]["storage_method"] = storage_method
+        rooms[room_id]["start_time"] = time.time()  # reinicio del tiempo al configurar
 
     return JSONResponse({"status": action, "room_id": room_id, "input_lang": input_lang, "storage_method": storage_method})
-
 
 # --- Endpoint estadísticas ---
 @app.get("/stats")
@@ -234,105 +198,7 @@ async def stats():
         })
     return JSONResponse(stats_data)
 
-
-# --- Export endpoints ---
-@app.get("/export/original/{room_id}")
-async def export_original(room_id: str):
-    if room_id not in rooms:
-        return JSONResponse({"error": "Sala no encontrada"}, status_code=404)
-    text_segments = rooms[room_id].get("transcript_original", [])
-    full_text = "\n".join(text_segments).strip()
-    if full_text == "":
-        return JSONResponse({"room_id": room_id, "text": ""})
-    # devolver como attachment txt
-    return Response(content=full_text, media_type="text/plain", headers={
-        "Content-Disposition": f"attachment; filename={room_id}_original.txt"
-    })
-
-
-@app.get("/export/translation/{room_id}/{lang}")
-async def export_translation(room_id: str, lang: str):
-    if room_id not in rooms:
-        return JSONResponse({"error": "Sala no encontrada"}, status_code=404)
-    lang_list = rooms[room_id].get("translations", {}).get(lang, [])
-    full_text = "\n".join(lang_list).strip()
-    return Response(content=full_text, media_type="text/plain", headers={
-        "Content-Disposition": f"attachment; filename={room_id}_translation_{lang}.txt"
-    })
-
-
-# Util: mapear input_lang a voz por defecto (neural voices)
-VOICE_MAP = {
-    "en-US": "en-US-JennyNeural",
-    "es-ES": "es-ES-AlvaroNeural",
-    "fr-FR": "fr-FR-DeniseNeural",
-    "it-IT": "it-IT-ElsaNeural",
-    "de-DE": "de-DE-KatjaNeural",
-    "pt-PT": "pt-PT-DuarteNeural",
-    "zh-CN": "zh-CN-XiaoxiaoNeural"
-}
-
-
-@app.post("/export/audio/{room_id}")
-async def export_audio(room_id: str, voice_lang: str = Form(None)):
-    """
-    Genera un WAV con el texto original completo de la sala usando Azure TTS y lo devuelve.
-    voice_lang: opcional, si no se pasa se elige automáticamente desde input_lang de la sala.
-    """
-    if room_id not in rooms:
-        return JSONResponse({"error": "Sala no encontrada"}, status_code=404)
-    segments = rooms[room_id].get("transcript_original", [])
-    full_text = "\n".join(segments).strip()
-    if not full_text:
-        return JSONResponse({"error": "No hay texto para sintetizar"}, status_code=400)
-
-    chosen_voice = None
-    if voice_lang:
-        chosen_voice = voice_lang
-    else:
-        input_lang = rooms[room_id].get("input_lang", "en-US")
-        chosen_voice = VOICE_MAP.get(input_lang, "en-US-JennyNeural")
-
-    # crear config de Azure TTS
-    try:
-        speech_config = speechsdk.SpeechConfig(subscription=SPEECH_KEY, region=SPEECH_REGION)
-        # voz
-        # la propiedad 'speech_synthesis_voice_name' define la voz
-        speech_config.speech_synthesis_voice_name = chosen_voice
-
-        # temporal file
-        tmpfile = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-        tmpfile_name = tmpfile.name
-        tmpfile.close()
-
-        audio_out = speechsdk.audio.AudioOutputConfig(filename=tmpfile_name)
-        synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=audio_out)
-
-        result = synthesizer.speak_text_async(full_text).get()
-        if result.reason != speechsdk.ResultReason.SynthesizingAudioCompleted:
-            print("TTS failed:", result.reason)
-            return JSONResponse({"error": "Fallo en la síntesis de audio"}, status_code=500)
-
-        # leer bytes y devolver
-        def iterfile():
-            with open(tmpfile_name, "rb") as f:
-                while True:
-                    chunk = f.read(4096)
-                    if not chunk:
-                        break
-                    yield chunk
-
-        filename = f"{room_id}_original.wav"
-        headers = {
-            "Content-Disposition": f"attachment; filename={filename}"
-        }
-        return StreamingResponse(iterfile(), media_type="audio/wav", headers=headers)
-    except Exception as e:
-        print("Error generando audio:", e)
-        return JSONResponse({"error": "Error al generar audio"}, status_code=500)
-
-
-# --- Página principal (unchanged) ---
+# --- Página principal ---
 @app.get("/", response_class=HTMLResponse)
 def root():
     html_content = """
@@ -422,7 +288,6 @@ def root():
     </html>
     """
     return HTMLResponse(content=html_content)
-
 
 if __name__ == "__main__":
     import uvicorn
