@@ -13,14 +13,14 @@ import tempfile
 app = FastAPI()
 
 # Ajusta orígenes según tu frontend
-# origins = [
-#     "https://proud-dune-06afaf61e.1.azurestaticapps.net",
-# ]
-
-
 origins = [
-    "http://localhost:5173",
+    "https://proud-dune-06afaf61e.1.azurestaticapps.net",
 ]
+
+
+# origins = [
+#     "http://localhost:5173",
+# ]
 
 app.add_middleware(
     CORSMiddleware,
